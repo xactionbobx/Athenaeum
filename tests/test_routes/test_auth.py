@@ -538,3 +538,89 @@ class TestPendingRequests:
             cookies={"session": _token(adm, "admin")},
         )
         assert resp.status_code == 400
+
+
+# ── Reverse-proxy header auth ─────────────────────────────────────────────────
+
+AUTHENTIK = {"X-authentik-uid": "uid-bobby", "X-authentik-username": "bobby", "X-authentik-email": "bobby@example.com"}
+
+
+async def _configure_header_auth(c, **overrides):
+    # Saved directly: once header auth is on, the settings API itself needs an admin.
+    # ASGITransport reports the test client as 127.0.0.1, so that stands in for the proxy.
+    auth = {"form_enabled": True, "session_secret": SECRET, "session_days": DAYS, "header_enabled": True,
+            "header_trusted_proxies": ["127.0.0.1"], "header_logout_url": "https://sso.example.com/logout/"}
+    auth.update(overrides)
+    await settings_module.save_settings({"auth": auth})
+
+
+async def _link_header_user(user_id: str, sub: str):
+    from app.auth import HEADER_ISS
+    async with get_db() as db:
+        await db.execute("UPDATE users SET oidc_iss = ?, oidc_sub = ? WHERE id = ?", (HEADER_ISS, sub, user_id))
+        await db.commit()
+
+
+@pytest_asyncio.fixture
+async def header_client(db_path, tmp_path, monkeypatch):
+    settings_path = str(tmp_path / "settings.yaml")
+    monkeypatch.setattr(settings_module, "SETTINGS_PATH", settings_path)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        await _configure_header_auth(c)
+        yield c
+
+
+class TestHeaderAuth:
+    async def test_linked_user_signed_in_by_proxy(self, header_client):
+        uid = await _insert_user("bobby", "admin")
+        await _link_header_user(uid, "uid-bobby")
+        resp = await header_client.get("/api/auth/me", headers=AUTHENTIK)
+        assert resp.status_code == 200
+        body = resp.json()
+        assert (body["user_id"], body["role"], body["via"]) == (uid, "admin", "proxy")
+        assert body["logout_url"] == "https://sso.example.com/logout/"
+        assert (await header_client.get("/api/settings", headers=AUTHENTIK)).status_code == 200
+
+    async def test_no_header_still_needs_a_session(self, header_client):
+        assert (await header_client.get("/api/auth/me")).status_code == 401
+        assert (await header_client.get("/api/books")).status_code == 401
+
+    async def test_header_from_untrusted_peer_is_ignored(self, header_client):
+        uid = await _insert_user("bobby", "admin")
+        await _link_header_user(uid, "uid-bobby")
+        await _configure_header_auth(header_client, header_trusted_proxies=["10.9.9.9"])
+        assert (await header_client.get("/api/auth/me", headers=AUTHENTIK)).status_code == 401
+
+    async def test_trusted_proxy_by_hostname(self, header_client):
+        uid = await _insert_user("bobby", "admin")
+        await _link_header_user(uid, "uid-bobby")
+        await _configure_header_auth(header_client, header_trusted_proxies=["localhost"])
+        assert (await header_client.get("/api/auth/me", headers=AUTHENTIK)).status_code == 200
+
+    async def test_header_ignored_when_disabled(self, header_client):
+        uid = await _insert_user("bobby", "admin")
+        await _link_header_user(uid, "uid-bobby")
+        await _configure_header_auth(header_client, header_enabled=False)
+        assert (await header_client.get("/api/auth/me", headers=AUTHENTIK)).status_code == 401
+
+    async def test_unknown_id_provisioned_once_as_user(self, header_client):
+        first = await header_client.get("/api/auth/me", headers=AUTHENTIK)
+        second = await header_client.get("/api/auth/me", headers=AUTHENTIK)
+        assert first.status_code == 200 and second.status_code == 200
+        assert first.json()["user_id"] == second.json()["user_id"]
+        assert (first.json()["username"], first.json()["role"], first.json()["email"]) == ("bobby", "user", "bobby@example.com")
+        assert (await header_client.get("/api/settings", headers=AUTHENTIK)).status_code == 403
+
+    async def test_no_provisioning_when_auto_create_off(self, header_client):
+        await _configure_header_auth(header_client, header_auto_create=False)
+        assert (await header_client.get("/api/auth/me", headers=AUTHENTIK)).status_code == 401
+
+    async def test_never_links_an_existing_account_by_name_or_email(self, header_client):
+        # Proxy usernames and emails can be user-editable; only the stable id may link.
+        existing = await _insert_user("bobby", "admin")
+        async with get_db() as db:
+            await db.execute("UPDATE users SET email = ? WHERE id = ?", ("bobby@example.com", existing))
+            await db.commit()
+        body = (await header_client.get("/api/auth/me", headers=AUTHENTIK)).json()
+        assert body["user_id"] != existing
+        assert (body["username"], body["role"]) == ("bobby-2", "user")

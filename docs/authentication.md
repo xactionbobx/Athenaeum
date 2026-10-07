@@ -47,6 +47,30 @@ Athenaeum supports any standards-compliant OIDC provider (Authentik, Authelia, K
 
 ---
 
+## Reverse proxy sign-in (Authentik forward auth)
+
+When Athenaeum sits behind a proxy that already signs people in (Traefik with Authentik forward auth, for example), it can trust the proxy's identity headers so there is no second login. There is no UI for this yet; set it in `settings.yaml`:
+
+```yaml
+auth:
+  header_enabled: true
+  header_trusted_proxies: [traefik]     # IPs, CIDRs or hostnames of the proxy itself
+  header_logout_url: https://books.example.com/outpost.goauthentik.io/sign_out
+  # optional, these are the defaults:
+  header_uid: X-authentik-uid
+  header_username: X-authentik-username
+  header_email: X-authentik-email
+  header_auto_create: true
+```
+
+- Headers are only believed when the request comes **directly** from a trusted proxy address. Anything else on the network could set them itself.
+- Accounts are linked by the proxy's stable user id (`X-authentik-uid`), never by username or email, which users may be able to change. A new id gets a fresh **user** account when `header_auto_create` is on.
+- To link an existing account, set its `oidc_iss` to `proxy-header` and `oidc_sub` to the user's Authentik uid.
+- Form and OIDC login keep working for requests that do not come through the proxy.
+- Sign out sends the browser to `header_logout_url`, because only the proxy can end its session.
+
+---
+
 ## Roles
 
 | Role | Capabilities |

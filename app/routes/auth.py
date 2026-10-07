@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 from ..auth import (
     _active_modes, _auth_active, _make_session_token,
-    clear_session_cookie, require_admin, require_auth, set_session_cookie,
+    clear_session_cookie, header_identity, require_admin, require_auth, set_session_cookie,
 )
 from ..database import get_db
 from ..settings import get_settings
@@ -217,6 +217,13 @@ async def me(request: Request):
     settings = await get_settings()
     if not _auth_active(settings):
         return {"user_id": "anonymous", "role": "admin", "username": "anonymous", "force_password_change": False}
+
+    ident = await header_identity(request, settings)
+    if ident:
+        # Signed in by the reverse proxy: signing out has to end the proxy's session,
+        # or the next request signs straight back in.
+        return {**ident, "force_password_change": False, "via": "proxy",
+                "logout_url": settings.get("auth", {}).get("header_logout_url") or ""}
 
     token = request.cookies.get("session")
     if not token:
