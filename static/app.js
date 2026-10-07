@@ -155,6 +155,16 @@ function navigate(path, params = {}) {
 
 let _authUser = null; // { user_id, username, role, force_password_change } or null when unchecked
 
+// Signed in by the reverse proxy (e.g. Authentik): only the proxy can end the session,
+// so send the browser to its sign-out page. Returns true when it did.
+function proxySignOut() {
+  if (_authUser && _authUser.via === 'proxy' && _authUser.logout_url) {
+    window.location.href = _authUser.logout_url;
+    return true;
+  }
+  return false;
+}
+
 function authUser() { return _authUser; }
 function isAdmin() { return !_authUser || _authUser.role === 'admin'; }
 
@@ -3357,6 +3367,7 @@ route('/profile', async () => {
     </div>
   </div>`;
   document.getElementById('profile-logout-btn').addEventListener('click', async () => {
+    if (proxySignOut()) return;
     await fetch('/api/auth/logout', { method: 'POST' });
     _authUser = null;
     updateNavForRole();
@@ -4308,6 +4319,7 @@ route('/settings', async (params, qp) => {
         });
 
         document.getElementById('logout-btn')?.addEventListener('click', async () => {
+          if (proxySignOut()) return;
           await fetch('/api/auth/logout', { method: 'POST' });
           _authUser = null;
           navigate('/login');
